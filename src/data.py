@@ -11,7 +11,7 @@ load_dotenv()
 API_URL = "https://financialmodelingprep.com/stable/"
 API_KEY = os.getenv("API_KEY", "")
 REQUEST_TIMEOUT_SECONDS = 30
-UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+
 
 def get_universe() -> list[str]:
     """Fetch 3500 largest cap stocks from FMP stock screener."""
@@ -36,10 +36,11 @@ def get_universe() -> list[str]:
     if response.status_code != 200:
         return []
     
-    stock_pattern = re.compile(r"^[A-Z]+$|^[A-Z]+-[A-Z]$")
-    symbols = [x.get("symbol") for x in data if x.get("symbol") and stock_pattern.match(x.get("symbol"))]
+    reg = re.compile(r"^[A-Z]+$|^[A-Z]+-[A-Z]$")
+    symbols = {x.get("symbol"): x.get("sector") for x in data if x.get("symbol") and reg.match(x.get("symbol"))}
     print(f"[DEBUG] Extracted {len(symbols)} symbols matching pattern.")
     return symbols
+
 
 def load_symbol(symbol: str) -> Any:
     """Fetch and return JSON data for a symbol."""
@@ -60,27 +61,33 @@ def load_symbol(symbol: str) -> Any:
 
 
 def load_symbols(
-    symbols: list[str],
+    symbols: dict[str, str],
 ) -> pd.DataFrame:
     """Load symbols one by one and return as a DataFrame."""
     all_records: list[dict[str, Any]] = []
-    for symbol in symbols:
+    for symbol, sector in symbols.items():
         records = load_symbol(symbol)
         if len(records) < 1254:
             print(f"[DEBUG] Not enough data for {symbol}, skipping.")
             continue
+        for record in records:
+            record["sector"] = sector
         all_records.extend(records)
+    print(f"[DEBUG] Total records loaded: {len(all_records)}")
 
     return pd.DataFrame(all_records)
+
 
 def save_to_csv(df: pd.DataFrame, filename: str) -> None:
     """Save DataFrame to a CSV file."""
     df.to_csv(filename, index=False)
 
-def save_universe(symbols: list[str], filename: str) -> None:
+
+def save_universe(symbols: dict[str, str], filename: str) -> None:
     """Save universe symbols to a file."""
-    df = pd.DataFrame({"symbol": symbols})
+    df = pd.DataFrame({"symbol": list(symbols.keys()), "sector": list(symbols.values())})
     df.to_csv(filename, index=False)
+
 
 if __name__ == "__main__":
     universe = get_universe()

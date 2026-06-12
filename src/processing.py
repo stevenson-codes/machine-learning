@@ -70,6 +70,22 @@ def add_returns(df: pd.DataFrame, span: int) -> pd.DataFrame:
     return df
 
 
+def add_atr(df: pd.DataFrame, span: int) -> pd.DataFrame:
+    """Add Average True Range (ATR) column to DataFrame using original row-by-row style."""
+    df['prev_Close'] = df.groupby('symbol')['adjClose'].shift(1)
+    df['tr'] = df[['adjHigh', 'adjLow', 'adjClose', 'prev_Close']].apply(
+        lambda x: max(
+                x['adjHigh'] - x['adjLow'],
+                abs(x['adjHigh'] - x['prev_Close']) if not pd.isna(x['prev_Close']) else x['adjHigh'] - x['adjLow'],
+                abs(x['adjLow'] - x['prev_Close']) if not pd.isna(x['prev_Close']) else x['adjHigh'] - x['adjLow']
+            ),
+        axis=1
+    )
+    df[f'atr_{span}'] = df.groupby('symbol')['tr'].transform(lambda x: x.rolling(window=span).mean())
+    df.drop(columns=['tr', 'prev_Close'], inplace=True)
+    return df
+
+
 def add_rank(df: pd.DataFrame, span: int) -> pd.DataFrame:
     """Calculate the cross-sectional relative strength label for each stock."""
     df['future_close'] = df.groupby('symbol')['adjClose'].shift(-span)
@@ -93,15 +109,25 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
 if __name__ == "__main__":
     df = load_csv("data/raw/data.csv")
 
+    add_ema(df, span=5)
     add_ema(df, span=20)
+    add_ema(df, span=50)
+
+    add_rsi(df, period=7)
     add_rsi(df, period=14)
+
+    add_macd(df, span_short=5, span_long=10)
     add_macd(df, span_short=12, span_long=26)
+
     add_asi(df)
+    # add_atr(df, span=14)
+
     add_returns(df, span=1)
     add_returns(df, span=5)
     add_returns(df, span=20)
     add_returns(df, span=60)
-    add_rank(df, span=10)
+
+    add_rank(df, span=20)
 
     features = [col for col in df.columns if col not in ['date', 'sector', 'adjOpen', 'adjHigh', 'adjLow', 'volume', 'adjClose', 'symbol', 'rank', 'forward_return']]
 

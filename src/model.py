@@ -5,59 +5,110 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 class SoftSpearmanLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, temperature: float = 0.1):
         super().__init__()
+        self.temp = temperature
 
     def forward(self, y_pred, y_true):
-        # Center the predictions and true values around their batch means
-        pred_centered = y_pred - y_pred.mean()
-        true_centered = y_true - y_true.mean()
+        # CRITICAL FIX: Flatten inputs to 1D arrays to prevent broadcasting explosions
+        y_pred = y_pred.view(-1)  # Force shape to [Num_Stocks]
+        y_true = y_true.view(-1)  # Force shape to [Num_Stocks]
         
-        # Calculate the Pearson correlation on the cross-sectional distributions
+        # Now the pairwise matrix math works perfectly
+        # Shape becomes a clean 2D matrix: [Num_Stocks, Num_Stocks]
+        diff = y_pred.unsqueeze(1) - y_pred.unsqueeze(0)
+        soft_pairs = torch.sigmoid(diff / self.temp)
+        pred_rank = soft_pairs.sum(dim=1) 
+        
+        diff_true = y_true.unsqueeze(1) - y_true.unsqueeze(0)
+        true_rank = torch.sigmoid(diff_true / self.temp).sum(dim=1)
+
+        # Calculate Pearson Correlation on these flat soft ranks
+        pred_centered = pred_rank - pred_rank.mean()
+        true_centered = true_rank - true_rank.mean()
+        
         covariance = (pred_centered * true_centered).sum()
         pred_variance = (pred_centered ** 2).sum()
         true_variance = (true_centered ** 2).sum()
         
         correlation = covariance / (torch.sqrt(pred_variance * true_variance) + 1e-8)
-        
-        # We subtract correlation from 1 because optimizers try to *minimize* the loss.
-        # Minimizing (1 - corr) maximizes the actual correlation toward +1.0.
         return 1.0 - correlation
 
-class SequentialMarketDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, lookback: int = 20):
+class CrossSectionalDateDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, lookback: int = 60):
         self.lookback = lookback
         
-        df.dropna(inplace=True)
-        self.grouped = list(df.groupby('symbol'))
+        # 1. Pivot the dataframe so index is Date and Columns are [Symbol x Feature]
+        # This aligns all stocks perfectly in space and time
         feature_cols = [col for col in df.columns if col not in ['date', 'symbol', 'sector', 'rank', 'forward_return']]
+        self.feature_cols = feature_cols
         
-        self.samples = []
-        for _, group in self.grouped:
-            if len(group) < lookback:
-                continue
-            features = group[feature_cols].values
-            sector = group['sector'].values
-            rank = group['rank'].values
-            forward_return = group['forward_return'].values
-            
-            for i in range(lookback, len(group)):
-                self.samples.append({
-                    'cont': features[i-lookback:i],
-                    'sector': sector[i],
-                    'target': rank[i],
-                    'forward_return': forward_return[i]
-                })
+        # Sort chronologically
+        df = df.sort_values('date')
+        self.unique_dates = sorted(df['date'].unique())
+        
+        # Create a unified asset universe list to maintain matrix alignment
+        self.symbols = sorted(df['symbol'].unique())
+        self.symbol_to_idx = {sym: i for i, sym in enumerate(self.symbols)}
+        
+        # 2. Build dense 3D dense matrices up front [Total_Days, Total_Symbols, Features]
+        num_days = len(self.unique_dates)
+        num_symbols = len(self.symbols)
+        num_features = len(feature_cols)
+        
+        self.X_matrix = np.zeros((num_days, num_symbols, num_features), dtype=np.float32)
+        self.returns_matrix = np.zeros((num_days, num_symbols), dtype=np.float32)
+        self.sectors_matrix = np.zeros((num_days, num_symbols), dtype=np.int64)
+        self.mask_matrix = np.zeros((num_days, num_symbols), dtype=np.bool_) # To track which stocks are active
+        
+        # Map tabular data directly into our structured 3D numpy arrays
+        date_to_idx = {date: i for i, date in enumerate(self.unique_dates)}
+        
+        # 1. Map dates and symbols directly to integer axis index codes
+        date_codes = df['date'].map(date_to_idx).values
+        symbol_codes = df['symbol'].map(self.symbol_to_idx).values
+
+        # 2. Extract values as contiguous numpy arrays
+        feature_values = df[feature_cols].values.astype(np.float32)
+        return_values = df['forward_return'].values.astype(np.float32)
+        sector_values = df['sector'].values.astype(np.int64)
+
+        print("[INFO] Executing high-speed vectorized tensor population...")
+
+        # 3. Vectorized Multi-Dimensional Array Assignment (No Python loops!)
+        self.X_matrix[date_codes, symbol_codes, :] = feature_values
+        self.returns_matrix[date_codes, symbol_codes] = return_values
+        self.sectors_matrix[date_codes, symbol_codes] = sector_values
+        self.mask_matrix[date_codes, symbol_codes] = True
 
     def __len__(self):
-        return len(self.samples)
-    
+        # We can only sample days where a full lookback history exists
+        return len(self.unique_dates) - self.lookback
+
     def __getitem__(self, idx):
-        s = self.samples[idx]
+        # Shift index forward by lookback to provide an adequate baseline runway
+        t_idx = idx + self.lookback 
+        
+        # Extract 60 days of historical data for ALL symbols simultaneously via fast array slicing
+        # Resulting Shape: [Total_Symbols, 60, Features]
+        X_slice = self.X_matrix[t_idx - self.lookback : t_idx, :, :]
+        X_slice = np.transpose(X_slice, (1, 0, 2)) # Rearrange layout to: [Symbols, Lookback, Features]
+        
+        # Extract targets for the single target day (t_idx)
+        y_returns = self.returns_matrix[t_idx]
+        y_sectors = self.sectors_matrix[t_idx]
+        day_mask = self.mask_matrix[t_idx]
+        
+        # Filter out assets that do not have data recorded for this specific day
+        # (This keeps your dynamic universe clean and unpolluted by dead or unlisted stocks)
+        valid_X = X_slice[day_mask]
+        valid_returns = y_returns[day_mask]
+        valid_sectors = y_sectors[day_mask]
+        
         return (
-            torch.tensor(s['cont'], dtype=torch.float32),
-            torch.tensor(s['sector'], dtype=torch.long),
-            torch.tensor([s['target']], dtype=torch.float32)
+            torch.tensor(valid_X, dtype=torch.float32),
+            torch.tensor(valid_sectors, dtype=torch.long),
+            torch.tensor(valid_returns, dtype=torch.float32).unsqueeze(1)
         )
 
 class MarketLSTM(nn.Module):
@@ -76,15 +127,20 @@ class MarketLSTM(nn.Module):
         
         # Fully connected network fuses the final LSTM hidden state output with sector info
         self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 16),
+            nn.LayerNorm(16),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, 1),
-            nn.Sigmoid(),
+            nn.Dropout(0.3),
+            nn.Linear(16, 1),
         )
         
     def forward(self, data, sector_x):
+        # Cross-sectional loaders can emit [batch, symbols, lookback, features].
+        # Flatten batch and symbol axes so LSTM receives [N, lookback, features].
+        if data.dim() == 4:
+            batch_size, num_symbols, lookback, num_features = data.shape
+            data = data.reshape(batch_size * num_symbols, lookback, num_features)
+
         # cont_seq shape: [Batch, Lookback, Features]
         # out shape: [Batch, Lookback, Hidden_Dim]
         out, _ = self.lstm(data)
@@ -110,6 +166,11 @@ def run_backtest(model, val_loader, val_df, device, top_n: int = 20):
         for cont_batch, sector_batch, _ in val_loader:
             cont_batch = cont_batch.to(device)
             sector_batch = sector_batch.to(device)
+
+            if cont_batch.dim() == 4:
+                batch_size, num_symbols, lookback, num_features = cont_batch.shape
+                cont_batch = cont_batch.reshape(batch_size * num_symbols, lookback, num_features)
+                sector_batch = sector_batch.reshape(batch_size * num_symbols)
             
             preds = model(cont_batch, sector_batch)
             all_preds.extend(preds.cpu().numpy().flatten())
@@ -125,8 +186,10 @@ def run_backtest(model, val_loader, val_df, device, top_n: int = 20):
     # Quick sanity check: Ensure predictions line up 1:1 with sliced dataframe length
     if len(backtest_df) != len(all_preds):
         print(f"[WARNING] Row mismatch! DataFrame has {len(backtest_df)} rows, but got {len(all_preds)} predictions.")
-        # Optional fallback: trim or clip to handle minor edge group dropouts safely
-        backtest_df = backtest_df.iloc[:len(all_preds)]
+        # Trim both sides to a shared length so assignment remains valid.
+        aligned_len = min(len(backtest_df), len(all_preds))
+        backtest_df = backtest_df.iloc[:aligned_len].copy()
+        all_preds = all_preds[:aligned_len]
     
     backtest_df['predicted_rank'] = all_preds
     
@@ -149,9 +212,10 @@ def run_backtest(model, val_loader, val_df, device, top_n: int = 20):
     avg_return = np.mean(portfolio_returns)
     std_return = np.std(portfolio_returns) + 1e-8
     
-    # Annualized Sharpe (Assuming 10-day holding periods, there are ~25 periods in a trading year)
-    # Since your rank forward horizon span is 10, use np.sqrt(25) for true annualization
-    sharpe_ratio = (avg_return / std_return) * np.sqrt(25) 
+    # Annualized Sharpe for 20-trading-day holding periods (~252 trading days/year)
+    periods_per_year = 252 / 20
+    risk_free_rate = 0.04 / periods_per_year  # 4% annual risk-free rate, converted to per-period
+    sharpe_ratio = ((avg_return - risk_free_rate) / std_return) * np.sqrt(periods_per_year)
     
     print("\n" + "="*40)
     print(f"    LONG-ONLY BACKTEST RESULTS (TOP {top_n})   ")
@@ -273,33 +337,33 @@ def train_and_evaluate():
     # 3. Instantiate Sequential Lookback Datasets
     LOOKBACK = 60
     print("\n[INFO] Building 3D historical window matrices (this might take a minute)...")
-    train_dataset = SequentialMarketDataset(train_df, lookback=LOOKBACK)
-    val_dataset   = SequentialMarketDataset(val_df, lookback=LOOKBACK)
-    eval_dataset  = SequentialMarketDataset(eval_df, lookback=LOOKBACK)
+    train_dataset = CrossSectionalDateDataset(train_df, lookback=LOOKBACK)
+    val_dataset   = CrossSectionalDateDataset(val_df, lookback=LOOKBACK)
+    eval_dataset  = CrossSectionalDateDataset(eval_df, lookback=LOOKBACK)
     
     # 4. Create PyTorch DataLoaders
     # Large batch size keeps GPUs efficiently fully utilized for cross-sectional market universes
-    BATCH_SIZE = 4096 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    BATCH_SIZE = 1 
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
     val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
     eval_loader  = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
     
     # 5. Initialize Model parameters dynamically
     # Detect input dimensional size based on your column count filtering layout
     sample_cont, _, _ = train_dataset[0]
-    num_features = sample_cont.shape[1] # Will map out to your 8 continuous metrics
+    num_features = sample_cont.shape[2] # [Symbols, Lookback, Features]
     num_sectors = df['sector'].nunique() # Dynamic count of your integer labels
     
     # Select execution hardware target automatically
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"\n[INFO] Initializing MarketLSTM on platform target: {device}")
     
-    model = MarketLSTM(num_features=num_features, num_sectors=num_sectors, embedding_dim=4, hidden_dim=16)
+    model = MarketLSTM(num_features=num_features, num_sectors=num_sectors, embedding_dim=4, hidden_dim=32)
     model.to(device)
     
     # 6. Define Loss Function and Optimizer
     criterion = SoftSpearmanLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
     
     # 7. Core Multi-Epoch Training and Validation Loop
     EPOCHS = 20
@@ -315,6 +379,12 @@ def train_and_evaluate():
             cont_batch = cont_batch.to(device)
             sector_batch = sector_batch.to(device)
             target_batch = target_batch.to(device)
+
+            if cont_batch.dim() == 4:
+                batch_size, num_symbols, lookback, num_features = cont_batch.shape
+                cont_batch = cont_batch.reshape(batch_size * num_symbols, lookback, num_features)
+                sector_batch = sector_batch.reshape(batch_size * num_symbols)
+                target_batch = target_batch.reshape(batch_size * num_symbols, 1)
             
             optimizer.zero_grad()
             
@@ -339,6 +409,12 @@ def train_and_evaluate():
                 cont_batch = cont_batch.to(device)
                 sector_batch = sector_batch.to(device)
                 target_batch = target_batch.to(device)
+
+                if cont_batch.dim() == 4:
+                    batch_size, num_symbols, lookback, num_features = cont_batch.shape
+                    cont_batch = cont_batch.reshape(batch_size * num_symbols, lookback, num_features)
+                    sector_batch = sector_batch.reshape(batch_size * num_symbols)
+                    target_batch = target_batch.reshape(batch_size * num_symbols, 1)
                 
                 predictions = model(cont_batch, sector_batch)
                 loss = criterion(predictions, target_batch)
@@ -362,6 +438,12 @@ def train_and_evaluate():
             cont_batch = cont_batch.to(device)
             sector_batch = sector_batch.to(device)
             target_batch = target_batch.to(device)
+
+            if cont_batch.dim() == 4:
+                batch_size, num_symbols, lookback, num_features = cont_batch.shape
+                cont_batch = cont_batch.reshape(batch_size * num_symbols, lookback, num_features)
+                sector_batch = sector_batch.reshape(batch_size * num_symbols)
+                target_batch = target_batch.reshape(batch_size * num_symbols, 1)
             
             predictions = model(cont_batch, sector_batch)
             loss = criterion(predictions, target_batch)
@@ -372,8 +454,10 @@ def train_and_evaluate():
     print(f"Final System Evaluation | Avg Return: {avg_return:.5f} | Std Dev: {std_return:.5f} | Sharpe Ratio: {sharpe_ratio:.5f}")
     print("\n[INFO] Training complete. Saving target model weights checkpoint.")
     torch.save(model.state_dict(), f"models/{avg_return:.5f}_{std_return:.5f}_{sharpe_ratio:.5f}.pth")
+    return f"models/{avg_return:.5f}_{std_return:.5f}_{sharpe_ratio:.5f}.pth"
 
 if __name__ == "__main__":
-    for _ in range(10):
-        train_and_evaluate()
-        predict_latest(model_path="models/market_lstm.pth", top_n=20, hidden_dim=16)
+    filename = train_and_evaluate()
+    # for _ in range(10):
+    #     filename = train_and_evaluate()
+        # predict_latest(model_path="models/market_lstm.pth", top_n=20, hidden_dim=16)

@@ -73,14 +73,14 @@ def add_returns(df: pd.DataFrame, span: int) -> pd.DataFrame:
 def add_rank(df: pd.DataFrame, span: int) -> pd.DataFrame:
     """Calculate the cross-sectional relative strength label for each stock."""
     df['future_close'] = df.groupby('symbol')['adjClose'].shift(-span)
-    df['raw_forward_return'] = (df['future_close'] - df['adjClose']) / (df['adjClose'] + 1e-8)
-    df['rank'] = df.groupby('date')['raw_forward_return'].rank(pct=True)
-    df.drop(columns=['future_close', 'raw_forward_return'], inplace=True)
+    df['forward_return'] = (df['future_close'] - df['adjClose']) / (df['adjClose'] + 1e-8)
+    df['rank'] = df.groupby('date')['forward_return'].rank(pct=True)
+    df.drop(columns=['future_close'], inplace=True)
     return df
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize specified columns in the DataFrame."""
-    columns = [col for col in df.columns if col not in ['date', 'sector', 'adjOpen', 'adjHigh', 'adjLow', 'volume', 'adjClose', 'symbol']]
+    columns = [col for col in df.columns if col not in ['date', 'sector', 'adjOpen', 'adjHigh', 'adjLow', 'volume', 'adjClose', 'symbol', 'rank', 'forward_return']]
     for col in columns:
         df[col] = df.groupby('date')[col].transform(lambda x: (x - x.mean()) / (x.std() + 1e-8))
         df[col] = df[col].clip(lower=-3.0, upper=3.0)
@@ -101,14 +101,14 @@ if __name__ == "__main__":
     add_returns(df, span=5)
     add_returns(df, span=20)
     add_returns(df, span=60)
-    add_rank(df, span=20)
+    add_rank(df, span=10)
+
+    features = [col for col in df.columns if col not in ['date', 'sector', 'adjOpen', 'adjHigh', 'adjLow', 'volume', 'adjClose', 'symbol', 'rank', 'forward_return']]
 
     df.reset_index(drop=True, inplace=True)
-    df.dropna(inplace=True)
+    df.dropna(subset=features, inplace=True)
     save_csv(df, "data/processed/data.csv")
 
     normalize(df)
-    df.drop(columns=['adjOpen', 'adjHigh', 'adjLow', 'volume', 'adjClose', 'symbol'], inplace=True)
-
-    print(df.head())
+    df.drop(columns=['adjOpen', 'adjHigh', 'adjLow', 'volume', 'adjClose'], inplace=True)
     save_csv(df, "data/processed/normalized.csv")

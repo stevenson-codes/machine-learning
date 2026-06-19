@@ -14,11 +14,3 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.4.0",
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu121"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cuda" }

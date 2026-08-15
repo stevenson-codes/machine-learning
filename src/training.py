@@ -4,24 +4,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-class AsymmetricHuberLoss(nn.Module):
-    def __init__(self, delta: float = 1.0, over: float = 3.0, under: float = 1.0):
-        super().__init__()
-        self.delta = delta
-        self.over = over
-        self.under = under
-    
-    def forward(self, pred, target):
-        error = pred - target
-        abs = torch.abs(error)
-
-        quad = torch.clamp(abs, max=self.delta)
-        linear = abs - quad
-        huber = 0.5 * (quad ** 2) + self.delta * linear
-
-        loss = torch.where(error > 0, self.over * huber, self.under * huber)
-        return torch.mean(loss)
-
 class MarketDataset(Dataset):
     """Custom Dataset for market data."""
     def __init__(self, df: pd.DataFrame, lookback: int = 60):
@@ -35,17 +17,17 @@ class MarketDataset(Dataset):
 
         features = [col for col in df.columns if col not in ['date', 'sector', 'symbol', 'forward_return', 'vol_return']]
 
-        self.sequences = []
-        self.targets = []
+        sequences = []
+        targets = []
         for _, group in groups:
             feature_array = group[features].values.astype(np.float32)
             target_array = group['vol_return'].values.astype(np.float32)
             for i in range(len(group) - self.lookback):
-                self.sequences.append(feature_array[i:i + self.lookback])
-                self.targets.append(target_array[i + self.lookback])
+                sequences.append(feature_array[i:i + self.lookback])
+                targets.append(target_array[i + self.lookback])
 
-        self.sequences = np.array(self.sequences)
-        self.targets = np.array(self.targets)
+        self.sequences = torch.from_numpy(np.array(sequences))
+        self.targets = torch.from_numpy(np.array(targets))
 
 
     def __len__(self) -> int:
@@ -53,9 +35,7 @@ class MarketDataset(Dataset):
     
     
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x = torch.tensor(self.sequences[idx], dtype=torch.float32)
-        y = torch.tensor(self.targets[idx], dtype=torch.float32)
-        return x, y
+        return self.sequences[idx], self.targets[idx]
     
 class MarketLSTM(nn.Module):
     def __init__(self, num_features: int, hidden_dim: int = 64):
@@ -89,24 +69,24 @@ def train(filename: str, lookback: int = 60, model_size: int = 32) -> None:
     
     unique_dates = sorted(df['date'].unique())
     n_dates = len(unique_dates)
-    train_end = int(0.6 * n_dates)
-    val_end = int(0.8 * n_dates)
+    train_end = int(0.8 * n_dates)
+    val_end = int(n_dates)
     
     train_dates = set(unique_dates[:train_end])
     val_dates = set(unique_dates[train_end + 80:val_end])
-    test_dates = set(unique_dates[val_end:])
     
-    train_df = df[df['date'].isin(train_dates)].reset_index(drop=True)
-    val_df = df[df['date'].isin(val_dates)].reset_index(drop=True)
-    test_df = df[df['date'].isin(test_dates)].reset_index(drop=True)
+    date_split = df['date'].map(lambda x: 'train' if x in train_dates else ('val' if x in val_dates else 'test'))
+    train_df = df[date_split == 'train'].reset_index(drop=True)
+    val_df = df[date_split == 'val'].reset_index(drop=True)
+    # test_df = df[date_split == 'test'].reset_index(drop=True)
     
     train_dataset = MarketDataset(train_df, lookback=lookback)
     val_dataset = MarketDataset(val_df, lookback=lookback)
-    test_dataset = MarketDataset(test_df, lookback=lookback)
+    # test_dataset = MarketDataset(test_df, lookback=lookback)
     
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    # test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 
@@ -139,10 +119,10 @@ def train(filename: str, lookback: int = 60, model_size: int = 32) -> None:
             torch.save(model.state_dict(), f"models/checkpoint.pth")
 
     print("\n[INFO] Evaluating on test set...")
-    avg_return, std_return, sharpe_ratio = run_backtest(model, test_loader, test_df, device, top_n=10)
+    avg_return, std_return, sharpe_ratio = run_backtest(model, val_loader, val_df, device, top_n=10)
     torch.save(model.state_dict(), f"models/{avg_return:.4f}_{std_return:.4f}_{sharpe_ratio:.2f}.pth")
     model.load_state_dict(torch.load("models/checkpoint.pth"))
-    avg_return, std_return, sharpe_ratio = run_backtest(model, test_loader, test_df, device, top_n=10)
+    avg_return, std_return, sharpe_ratio = run_backtest(model, val_loader, val_df, device, top_n=10)
     torch.save(model.state_dict(), f"models/{avg_return:.4f}_{std_return:.4f}_{sharpe_ratio:.2f}.pth")
 
 def run_backtest(model, loader, df, device, top_n: int = 20):
@@ -158,10 +138,7 @@ def run_backtest(model, loader, df, device, top_n: int = 20):
             all_preds.extend(preds.cpu().numpy().flatten())
             
     data = df.copy()
-    valid_rows = []
-    for _, group in data.groupby('symbol'):
-        valid_rows.append(group.iloc[60:])
-    data = pd.concat(valid_rows).reset_index(drop=True)
+    data = data[data.groupby('symbol').cumcount() >= 60].reset_index(drop=True)
     data['predicted_rank'] = all_preds
     
     portfolio_returns = []
@@ -196,6 +173,6 @@ def run_backtest(model, loader, df, device, top_n: int = 20):
     return avg_return, std_return, sharpe_ratio
 
 if __name__ == "__main__":
-    for _ in range(10):
+    for _ in range(30):
         train("data/processed/normalized.csv", lookback=60, model_size=32)
     # train("data/processed/normalized.csv", lookback=60, model_size=32)

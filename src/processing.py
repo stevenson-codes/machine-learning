@@ -58,20 +58,23 @@ def add_macd(df: pd.DataFrame, span_short: int, span_long: int) -> pd.DataFrame:
 
 
 def add_asi(df: pd.DataFrame) -> pd.DataFrame:
-    """Add Accumulation Swing Index (ASI) using fast NumPy arrays to prevent KeyErrors."""
+    """Add Accumulation Swing Index (ASI) using vectorized NumPy operations."""
     def calculate_asi(group):
         high = group['adjHigh'].to_numpy()
         low = group['adjLow'].to_numpy()
         close = group['adjClose'].to_numpy()
-        asi = [0.0]
-        for i in range(1, len(group)):
-            tr = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
-            if tr == 0:
-                asi.append(asi[-1])
-            else:
-                asi_value = asi[-1] + ((close[i] - close[i-1]) + 0.5 * (close[i] - low[i]) + 0.25 * (close[i-1] - high[i])) / tr * 100
-                asi.append(asi_value)
-        return pd.Series(asi, index=group.index) / 100
+        tr = np.maximum(
+            high[1:] - low[1:],
+            np.maximum(
+                np.abs(high[1:] - close[:-1]),
+                np.abs(low[1:] - close[:-1])
+            )
+        )
+        tr = np.where(tr == 0, 1e-8, tr)
+        numerator = (close[1:] - close[:-1]) + 0.5 * (close[1:] - low[1:]) + 0.25 * (close[:-1] - high[1:])
+        asi_increments = (numerator / tr) * 100
+        asi_values = np.concatenate([[0.0], np.cumsum(asi_increments)]) / 100
+        return pd.Series(asi_values, index=group.index)
 
     df['asi'] = df.groupby('symbol', group_keys=False).apply(calculate_asi)
     df['asi'] = df.groupby('symbol')['asi'].transform(lambda x: x.diff())
@@ -166,5 +169,5 @@ if __name__ == "__main__":
     df.dropna(subset=features, inplace=True)
     save_csv(df, "data/processed/data.csv")
 
-    df.drop(columns=['adjOpen', 'adjHigh', 'adjLow', 'volume', 'adjClose'], inplace=True)
+    df.drop(columns=['adjOpen', 'adjHigh', 'adjLow', 'adjClose'], inplace=True)
     save_csv(df, "data/processed/normalized.csv")

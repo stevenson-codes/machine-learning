@@ -19,6 +19,30 @@ def build_lookback(df: pd.DataFrame, features: list, date: str, lookback: int = 
             
     return samples
 
+def apply_volume_filter(results: pd.DataFrame, df_raw: pd.DataFrame, date: str, min_volume: float = 1_000_000) -> pd.DataFrame:
+    volume_mask = []
+    
+    for symbol in results['symbol']:
+        group = df_raw[df_raw['symbol'] == symbol]
+        group_snapshot = group[group['date'] <= date].sort_values('date')
+        
+        if len(group_snapshot) == 0:
+            volume_mask.append(False)
+            continue
+        
+        current_volume = group_snapshot['volume'].iloc[-1]
+        
+        if current_volume >= min_volume:
+            volume_mask.append(True)
+        else:
+            volume_mask.append(False)
+    
+    filtered = results[volume_mask].reset_index(drop=True)
+    filtered_count = len(results) - len(filtered)
+    print(f"[INFO] Volume filter removed {filtered_count} stocks below {min_volume:,.0f} volume threshold")
+    
+    return filtered
+
 def apply_trend_filter(results: pd.DataFrame, df_raw: pd.DataFrame, date: str, sma_period: int = 50) -> pd.DataFrame:
     trend_mask = []
     
@@ -52,9 +76,9 @@ def predict(models_dir: str = 'models/best', top_n: int = 20) -> pd.DataFrame:
     df_raw = pd.read_csv('data/raw/data.csv')
     df_raw['date'] = pd.to_datetime(df_raw['date'])
     
-    features = [col for col in df.columns if col not in ['date', 'sector', 'symbol', 'forward_return', 'vol_return']]
+    features = [col for col in df.columns if col not in ['date', 'sector', 'symbol', 'forward_return', 'vol_return', 'volume']]
     
-    date = pd.to_datetime(df['date'].max()) - pd.Timedelta(days=20)
+    date = pd.to_datetime(df['date'].max())
     print(f"[INFO] Making predictions for date: {date}")
     
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
@@ -92,6 +116,7 @@ def predict(models_dir: str = 'models/best', top_n: int = 20) -> pd.DataFrame:
         results[f'model_{i}_score'] = all_scores[i]
         results[f'model_{i}_rank'] = all_ranks[i]
     
+    results = apply_volume_filter(results, df_raw, date, min_volume=1_000_000)
     results = apply_trend_filter(results, df_raw, date, sma_period=200)
     
     top_picks = results.sort_values('avg_rank').head(top_n).reset_index(drop=True)

@@ -14,3 +14,6 @@ wheels/
 
 # Data files
 data/
+
+# Model files
+models/
